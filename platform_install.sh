@@ -84,4 +84,3 @@ echo '安装完成，平台地址：http://121.5.5.98'
 echo '请在文件管理器中打开：/home/ubuntu/temperature-platform/登录信息.txt'
 echo '账号密码只保存在服务器私有文件中，没有输出到终端。'
 echo '关闭此终端后，平台仍会继续运行。'
-
