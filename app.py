@@ -37,6 +37,7 @@ logger = logging.getLogger("uvicorn.error")
 gee_lock = threading.Lock()
 gee_ready = False
 gee_connection = "not_started"
+map_check = {"status": "not_started"}
 DATASET = "MODIS/061/MOD11A1"
 
 
@@ -128,8 +129,9 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 3,
-            "gee_initialized": gee_ready, "gee_connection": gee_connection}
+    return {"status": "ok", "service": "gee-worker", "api_version": 4,
+            "gee_initialized": gee_ready, "gee_connection": gee_connection,
+            "map_check": map_check}
 
 
 @app.get("/platform/install.sh", include_in_schema=False)
@@ -174,6 +176,20 @@ def startup_gee_check():
         logger.error("GEE_AUTO_CHECK_FAILED: %s", json.dumps(error.detail, ensure_ascii=False))
     else:
         logger.info("GEE_AUTO_CHECK_OK: connected to Google Earth Engine")
+        map_check.update(status="checking")
+        try:
+            result = run_gee(check_map_connection)
+        except HTTPException as error:
+            detail = error.detail if isinstance(error.detail, dict) else {"message": str(error.detail)}
+            # 测试只用公开的北京 MODIS 数据；公开状态中隐藏完整下载链接。
+            message = re.sub(r"https?://[^\s\"'<>]+", "[redacted URL]",
+                             safe_error_message(detail.get("message", "Map check failed")))
+            map_check.update(status="failed", error_type=detail.get("error_type", "HTTPException"),
+                             message=message)
+            logger.error("GEE_MAP_CHECK_FAILED: %s", json.dumps(map_check, ensure_ascii=False))
+        else:
+            map_check.update(result)
+            logger.info("GEE_MAP_CHECK_OK: generated %s bytes", result["png_bytes"])
 
 
 @app.get("/gee-check", dependencies=[Depends(check_token)])
@@ -239,6 +255,19 @@ def download_map(image, area):
     if not content.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("Thumbnail is not a PNG")
     return base64.b64encode(content).decode("ascii")
+
+
+def check_map_connection():
+    """用上个月的北京公开影像检查实际的温度图生成流程。"""
+    today = datetime.now(timezone.utc).date()
+    year = today.year if today.month > 1 else today.year - 1
+    month = today.month - 1 if today.month > 1 else 12
+    start = ee.Date.fromYMD(year, month, 1)
+    area = ee.Geometry.Point([116.40, 39.90]).buffer(100000).bounds()
+    image = (ee.ImageCollection(DATASET).filterDate(start, start.advance(1, "month"))
+             .filterBounds(area).map(to_celsius).mean())
+    png = download_map(image, area)
+    return {"status": "ok", "png_bytes": len(base64.b64decode(png))}
 
 
 def calculate_temperature(query):
@@ -313,7 +342,8 @@ def calculate_temperature(query):
         try:
             result["map_png_base64"] = download_map(mean_image, full_area.bounds())
         except Exception as error:
-            logger.warning("Map download failed (%s)", type(error).__name__)
+            logger.warning("Map download failed (%s): %s", type(error).__name__,
+                           safe_error_message(error))
             result["warnings"].append("map_unavailable")
     return result
 
@@ -324,4 +354,3 @@ def temperature(query: TemperatureQuery):
     if (query.year, query.month) > (today.year, today.month):
         raise HTTPException(422, detail="A future month cannot be queried")
     return run_gee(lambda: calculate_temperature(query))
-
