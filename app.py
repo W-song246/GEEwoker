@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 from datetime import date, datetime, timezone
 
@@ -54,20 +55,52 @@ def initialize_gee():
     gee_ready = True
 
 
+def safe_error_message(error):
+    """显示 Google 返回的具体原因，同时移除口令、私钥和访问令牌。"""
+    message = str(error)
+    sensitive = [os.getenv("WORKER_TOKEN", ""),
+                 os.getenv("GEE_SERVICE_ACCOUNT_JSON", "")]
+    try:
+        info = json.loads(os.getenv("GEE_SERVICE_ACCOUNT_JSON", ""))
+        if isinstance(info, dict):
+            sensitive.extend(info.get(name, "") for name in
+                             ("private_key", "private_key_id", "client_secret"))
+    except (ValueError, TypeError):
+        pass
+    for value in sensitive:
+        if isinstance(value, str) and value:
+            message = message.replace(value, "[redacted]")
+            message = message.replace(json.dumps(value)[1:-1], "[redacted]")
+    message = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?"
+                     r"(?:-----END [^-]*PRIVATE KEY-----|$)",
+                     "[redacted private key]", message, flags=re.S)
+    message = re.sub(r"(?i)Bearer\s+[^\s\"',<>]+", "Bearer [redacted]", message)
+    message = re.sub(r"\bya29\.[A-Za-z0-9._-]+", "[redacted access token]", message)
+    message = re.sub(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\."
+                     r"[A-Za-z0-9_-]{12,}\b", "[redacted JWT]", message)
+    message = re.sub(r"(https?://[^\s?#\"'<>]+)\?[^\s\"'<>]+",
+                     r"\1?[redacted query]", message)
+    return message[:1500] or type(error).__name__
+
+
 def run_gee(operation):
     """免费实例先一次处理一个 GEE 查询，避免同时占满配额和内存。"""
     if not gee_lock.acquire(blocking=False):
         raise HTTPException(429, detail="A query is running. Try again later.",
                             headers={"Retry-After": "15"})
+    stage = "initialize_gee"
     try:
         initialize_gee()
+        stage = "gee_query"
         return operation()
     except HTTPException:
         raise
     except Exception as error:
-        # 不将凭据或包含私人信息的完整异常写入公共响应。
-        logger.error("GEE request failed (%s)", type(error).__name__)
-        raise HTTPException(502, detail="GEE request failed; check project access and connectivity") from None
+        message = safe_error_message(error)
+        logger.error("GEE failed at %s (%s): %s", stage, type(error).__name__, message)
+        raise HTTPException(502, detail={
+            "stage": stage, "error_type": type(error).__name__, "message": message,
+        }) from None
     finally:
         gee_lock.release()
 
@@ -76,7 +109,7 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status=ok 仅表示这个服务在运行；/gee-check 才实际验证 GEE。
-    return {"status": "ok", "service": "gee-worker", "api_version": 1,
+    return {"status": "ok", "service": "gee-worker", "api_version": 2,
             "gee_initialized": gee_ready}
 
 
@@ -232,3 +265,4 @@ def temperature(query: TemperatureQuery):
     if (query.year, query.month) > (today.year, today.month):
         raise HTTPException(422, detail="A future month cannot be queried")
     return run_gee(lambda: calculate_temperature(query))
+
