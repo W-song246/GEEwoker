@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import threading
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
 import ee
@@ -16,10 +17,24 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 
-app = FastAPI(title="GEE temperature worker", docs_url=None, redoc_url=None)
-logger = logging.getLogger("gee_worker")
+@asynccontextmanager
+async def lifespan(application):
+    """服务上线后自动检查一次 GEE；不阻塞网页和健康检查。"""
+    global gee_connection
+    if os.getenv("GEE_SERVICE_ACCOUNT_JSON", "").strip():
+        gee_connection = "checking"
+        threading.Thread(target=startup_gee_check, daemon=True).start()
+    else:
+        gee_connection = "not_configured"
+    yield
+
+
+app = FastAPI(title="GEE temperature worker", docs_url=None, redoc_url=None,
+              lifespan=lifespan)
+logger = logging.getLogger("uvicorn.error")
 gee_lock = threading.Lock()
 gee_ready = False
+gee_connection = "not_started"
 DATASET = "MODIS/061/MOD11A1"
 
 
@@ -108,18 +123,42 @@ def run_gee(operation):
 @app.get("/")
 @app.get("/health")
 def health():
-    # status=ok 仅表示这个服务在运行；/gee-check 才实际验证 GEE。
-    return {"status": "ok", "service": "gee-worker", "api_version": 2,
-            "gee_initialized": gee_ready}
+    # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
+    return {"status": "ok", "service": "gee-worker", "api_version": 3,
+            "gee_initialized": gee_ready, "gee_connection": gee_connection}
+
+
+def check_gee_connection():
+    global gee_connection
+
+    def operation():
+        value = ee.Number(1).getInfo()
+        if value != 1:
+            raise RuntimeError("GEE returned an unexpected check value")
+        return {"status": "ok", "gee_value": value,
+                "checked_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        result = run_gee(operation)
+    except HTTPException as error:
+        if error.status_code != 429:
+            gee_connection = "failed"
+        raise
+    gee_connection = "ok"
+    return result
+
+
+def startup_gee_check():
+    try:
+        check_gee_connection()
+    except HTTPException as error:
+        logger.error("GEE_AUTO_CHECK_FAILED: %s", json.dumps(error.detail, ensure_ascii=False))
+    else:
+        logger.info("GEE_AUTO_CHECK_OK: connected to Google Earth Engine")
 
 
 @app.get("/gee-check", dependencies=[Depends(check_token)])
 def gee_check():
-    def operation():
-        value = ee.Number(1).getInfo()
-        return {"status": "ok", "gee_value": value,
-                "checked_at": datetime.now(timezone.utc).isoformat()}
-    return run_gee(operation)
+    return check_gee_connection()
 
 
 class TemperatureQuery(BaseModel):
