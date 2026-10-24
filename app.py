@@ -10,10 +10,12 @@ import re
 import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 import ee
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -120,12 +122,30 @@ def run_gee(operation):
         gee_lock.release()
 
 
+@app.head("/")
+@app.head("/health")
 @app.get("/")
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
     return {"status": "ok", "service": "gee-worker", "api_version": 3,
             "gee_initialized": gee_ready, "gee_connection": gee_connection}
+
+
+@app.get("/platform/install.sh", include_in_schema=False)
+def platform_installer():
+    path = Path(__file__).resolve().with_name("platform_install.sh")
+    if not path.is_file():
+        raise HTTPException(404, detail="Installer is not available")
+    return FileResponse(path, media_type="text/plain")
+
+
+@app.get("/platform/bundle.zip", include_in_schema=False)
+def platform_bundle():
+    path = Path(__file__).resolve().with_name("platform_bundle.zip")
+    if not path.is_file():
+        raise HTTPException(404, detail="Package is not available")
+    return FileResponse(path, media_type="application/zip", filename="temperature-platform.zip")
 
 
 def check_gee_connection():
