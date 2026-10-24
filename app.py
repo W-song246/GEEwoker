@@ -5,6 +5,7 @@ import calendar
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -13,7 +14,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import ee
-import requests
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -129,7 +129,7 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 4,
+    return {"status": "ok", "service": "gee-worker", "api_version": 5,
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
             "map_check": map_check}
 
@@ -176,6 +176,7 @@ def startup_gee_check():
         logger.error("GEE_AUTO_CHECK_FAILED: %s", json.dumps(error.detail, ensure_ascii=False))
     else:
         logger.info("GEE_AUTO_CHECK_OK: connected to Google Earth Engine")
+        map_check.clear()
         map_check.update(status="checking")
         try:
             result = run_gee(check_map_connection)
@@ -236,24 +237,38 @@ def make_daily_rows(year, month, observations):
 
 
 def download_map(image, area):
-    url = image.clip(area).getThumbURL({
-        "region": area, "dimensions": 700, "format": "png", "crs": "EPSG:3857",
-        "min": -20, "max": 50,
-        "palette": ["0000ff", "00ffff", "00ff00", "ffff00", "ff0000"],
+    """通过已有的计算权限直接取得 PNG，不创建额外的缩略图资源。"""
+    coordinates = area.bounds(maxError=100, proj="EPSG:3857").coordinates().getInfo()[0]
+    xs = [point[0] for point in coordinates]
+    ys = [point[1] for point in coordinates]
+    left, right, bottom, top = min(xs), max(xs), min(ys), max(ys)
+    span_x, span_y = right - left, top - bottom
+    if (not all(math.isfinite(value) for value in (left, right, bottom, top))
+            or span_x <= 0 or span_y <= 0):
+        raise ValueError("Invalid map bounds")
+    pixel_size = max(span_x, span_y) / 700
+    width = max(1, min(700, math.ceil(span_x / pixel_size)))
+    height = max(1, min(700, math.ceil(span_y / pixel_size)))
+    visual = image.clip(area).visualize(
+        min=-20, max=50, forceRgbOutput=True,
+        palette=["0000ff", "00ffff", "00ff00", "ffff00", "ff0000"],
+    )
+    # Earth Engine SDK 会携带服务账号认证；PNG 字节由本服务交给国内服务器。
+    content = ee.data.computePixels({
+        "expression": visual, "fileFormat": "PNG",
+        "grid": {
+            "dimensions": {"width": width, "height": height},
+            "affineTransform": {
+                "scaleX": span_x / width, "shearX": 0, "translateX": left,
+                "shearY": 0, "scaleY": -span_y / height, "translateY": top,
+            },
+            "crsCode": "EPSG:3857",
+        },
     })
-    # 图像由本服务下载后交给国内服务器，浏览器不需要直连 Google。
-    with requests.get(url, timeout=(10, 90), stream=True) as response:
-        response.raise_for_status()
-        chunks = []
-        size = 0
-        for chunk in response.iter_content(65536):
-            size += len(chunk)
-            if size > 4 * 1024 * 1024:
-                raise ValueError("Thumbnail exceeds size limit")
-            chunks.append(chunk)
-    content = b"".join(chunks)
+    if len(content) > 4 * 1024 * 1024:
+        raise ValueError("Temperature map exceeds size limit")
     if not content.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError("Thumbnail is not a PNG")
+        raise ValueError("Temperature map is not a PNG")
     return base64.b64encode(content).decode("ascii")
 
 
