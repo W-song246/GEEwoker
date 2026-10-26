@@ -130,7 +130,7 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 6,
+    return {"status": "ok", "service": "gee-worker", "api_version": 7,
             "capabilities": ["center-temperature-30km-v1"],
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
             "map_check": map_check}
@@ -278,12 +278,15 @@ def download_map(image, area, palette=None, white_background=False):
 
 
 def check_map_connection():
-    """用上月合肥公开影像验证30公里单日取数与真实PNG生成。"""
+    """用上月合肥公开影像核对月、日范围与真实PNG生成。"""
     today = datetime.now(timezone.utc).date()
     year = today.year if today.month > 1 else today.year - 1
     month = today.month - 1 if today.month > 1 else 12
     monthly = calculate_center_temperature(CenterTemperatureQuery(
-        longitude=117.22, latitude=31.82, year=year, month=month, include_map=False))
+        longitude=117.22, latitude=31.82, year=year, month=month, include_map=True))
+    monthly_png = monthly.get("map_png_base64")
+    if not monthly_png:
+        raise RuntimeError("Center30 monthly map was not generated")
     available = next((row for row in monthly["daily"] if row["status"] == "available"
                       and (row.get("coverage_fraction") or 0) >= .2), None)
     if available is None:
@@ -298,7 +301,11 @@ def check_map_connection():
     return {"status": "ok", "schema": daily["schema"], "mode": "day", "date": chosen.isoformat(),
             "city_reference": "Hefei", "radius_m": CENTER_RADIUS_M, "unit": "degC",
             "mean": daily["statistics"]["mean"], "valid_pixels": daily["statistics"]["valid_pixels"],
-            "png_bytes": len(content), "png_sha256": hashlib.sha256(content).hexdigest()}
+            "png_bytes": len(content), "png_sha256": hashlib.sha256(content).hexdigest(),
+            "month": f"{year:04d}-{month:02d}", "month_total_pixels": monthly["total_pixels"],
+            "month_valid_pixels": monthly["statistics"]["valid_pixels"],
+            "month_max_daily_valid_pixels": max(row["valid_pixels"] for row in monthly["daily"]),
+            "month_png_bytes": len(base64.b64decode(monthly_png))}
 
 
 def calculate_temperature(query):
@@ -477,20 +484,26 @@ def calculate_center_temperature(query):
         }))
 
     mean_image = collection.mean()
+    # count 与 mean/min/max 组合后使用相同的区域取样口径；总像元数也必须
+    # 通过同一 reducer、同一网格计算。单独的 count reducer 对圆边缘像元
+    # 采用不同的纳入规则，可能比组合 reducer 的有效像元数少。
+    full_grid = ee.Image.constant(1).rename("LST_C")
     values = ee.Dictionary({
         "summary": reduce_image(mean_image),
-        "total": ee.Image.constant(1).rename("pixels").reduceRegion(
-            reducer=ee.Reducer.count(), geometry=area, scale=1000, crs=projection, maxPixels=1e7),
+        "total": reduce_image(full_grid),
         "daily": collection.map(daily_statistics).aggregate_array("center_daily"),
     }).getInfo()
-    total = int(values["total"].get("pixels") or 0)
+    total = int(values["total"].get("LST_C_count") or 0)
     summary = values["summary"]
     pixels = int(summary.get("LST_C_count") or 0)
+    daily = values.get("daily") or []
+    if pixels > total or any(int(row.get("valid_pixels") or 0) > total for row in daily):
+        raise RuntimeError("Center30 valid pixel count exceeds total pixel count on the same grid")
     result["total_pixels"] = total
     result["statistics"] = {"mean": summary.get("LST_C_mean"), "min": summary.get("LST_C_min"),
                             "max": summary.get("LST_C_max"), "valid_pixels": pixels,
                             "coverage_fraction": pixels / total if total else None}
-    result["daily"] = center_daily_rows(first, end, values.get("daily") or [], total)
+    result["daily"] = center_daily_rows(first, end, daily, total)
     if pixels == 0 or summary.get("LST_C_mean") is None:
         result["status"] = "missing_pixels"
     elif query.include_map:
