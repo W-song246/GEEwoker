@@ -3,6 +3,7 @@
 import base64
 import calendar
 import hmac
+import hashlib
 import json
 import logging
 import math
@@ -10,7 +11,7 @@ import os
 import re
 import threading
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import ee
@@ -129,7 +130,8 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 5,
+    return {"status": "ok", "service": "gee-worker", "api_version": 6,
+            "capabilities": ["center-temperature-30km-v1"],
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
             "map_check": map_check}
 
@@ -236,7 +238,7 @@ def make_daily_rows(year, month, observations):
     return rows
 
 
-def download_map(image, area):
+def download_map(image, area, palette=None, white_background=False):
     """通过已有的计算权限直接取得 PNG，不创建额外的缩略图资源。"""
     coordinates = area.bounds(maxError=100, proj="EPSG:3857").coordinates().getInfo()[0]
     xs = [point[0] for point in coordinates]
@@ -251,8 +253,11 @@ def download_map(image, area):
     height = max(1, min(700, math.ceil(span_y / pixel_size)))
     visual = image.clip(area).visualize(
         min=-20, max=50, forceRgbOutput=True,
-        palette=["0000ff", "00ffff", "00ff00", "ffff00", "ff0000"],
+        palette=palette or ["0000ff", "00ffff", "00ff00", "ffff00", "ff0000"],
     )
+    if white_background:
+        # 只填显示颜色，不修改任何温度统计或温度影像的掩膜。
+        visual = visual.unmask(255)
     # Earth Engine SDK 会携带服务账号认证；PNG 字节由本服务交给国内服务器。
     content = ee.data.computePixels({
         "expression": visual, "fileFormat": "PNG",
@@ -273,16 +278,27 @@ def download_map(image, area):
 
 
 def check_map_connection():
-    """用上个月的北京公开影像检查实际的温度图生成流程。"""
+    """用上月合肥公开影像验证30公里单日取数与真实PNG生成。"""
     today = datetime.now(timezone.utc).date()
     year = today.year if today.month > 1 else today.year - 1
     month = today.month - 1 if today.month > 1 else 12
-    start = ee.Date.fromYMD(year, month, 1)
-    area = ee.Geometry.Point([116.40, 39.90]).buffer(100000).bounds()
-    image = (ee.ImageCollection(DATASET).filterDate(start, start.advance(1, "month"))
-             .filterBounds(area).map(to_celsius).mean())
-    png = download_map(image, area)
-    return {"status": "ok", "png_bytes": len(base64.b64decode(png))}
+    monthly = calculate_center_temperature(CenterTemperatureQuery(
+        longitude=117.22, latitude=31.82, year=year, month=month, include_map=False))
+    available = next((row for row in monthly["daily"] if row["status"] == "available"
+                      and (row.get("coverage_fraction") or 0) >= .2), None)
+    if available is None:
+        raise RuntimeError("No day with sufficient pixels for the public center30 map check")
+    chosen = date.fromisoformat(available["date"])
+    daily = calculate_center_temperature(CenterTemperatureQuery(
+        longitude=117.22, latitude=31.82, year=year, month=month, day=chosen.day, include_map=True))
+    encoded = daily.get("map_png_base64")
+    if not encoded:
+        raise RuntimeError("Center30 daily map was not generated")
+    content = base64.b64decode(encoded)
+    return {"status": "ok", "schema": daily["schema"], "mode": "day", "date": chosen.isoformat(),
+            "city_reference": "Hefei", "radius_m": CENTER_RADIUS_M, "unit": "degC",
+            "mean": daily["statistics"]["mean"], "valid_pixels": daily["statistics"]["valid_pixels"],
+            "png_bytes": len(content), "png_sha256": hashlib.sha256(content).hexdigest()}
 
 
 def calculate_temperature(query):
@@ -369,3 +385,125 @@ def temperature(query: TemperatureQuery):
     if (query.year, query.month) > (today.year, today.month):
         raise HTTPException(422, detail="A future month cannot be queried")
     return run_gee(lambda: calculate_temperature(query))
+
+
+# 新工作台只查询中心30公里；原 /temperature 保留给已经部署的旧站点。
+CENTER_RADIUS_M = 30000
+CENTER_PALETTE = ["313695", "4575b4", "74add1", "abd9e9", "e0f3f8", "ffffbf",
+                  "fee090", "fdae61", "f46d43", "d73027", "a50026"]
+
+
+class CenterTemperatureQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-85, le=85)
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+    day: int | None = Field(default=None, ge=1, le=31)
+    include_map: bool = True
+
+
+def center_query_dates(query, today=None):
+    """日请求的结束为次日；月请求的结束为下月1日，均为右开区间。"""
+    today = today or datetime.now(timezone.utc).date()
+    try:
+        first = date(query.year, query.month, query.day or 1)
+    except ValueError:
+        raise HTTPException(422, detail="Invalid calendar date") from None
+    if first > today:
+        raise HTTPException(422, detail="A future date or month cannot be queried")
+    if query.day is not None:
+        return first, first + timedelta(days=1)
+    return first, (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def center_daily_rows(first, end, observations, total_pixels, today=None):
+    today = today or datetime.now(timezone.utc).date()
+    by_date = {item["date"]: item for item in observations}
+    rows = []
+    current = first
+    while current < end:
+        item = by_date.get(current.isoformat())
+        pixels = int((item or {}).get("valid_pixels") or 0)
+        valid = item is not None and item.get("mean") is not None and pixels > 0
+        rows.append({"date": current.isoformat(), "mean": item.get("mean") if valid else None,
+                     "min": item.get("min") if valid else None, "max": item.get("max") if valid else None,
+                     "valid_pixels": pixels, "coverage_fraction": pixels / total_pixels if total_pixels else None,
+                     "status": "available" if valid else "future" if current > today else "no_image" if item is None else "missing_pixels"})
+        current += timedelta(days=1)
+    return rows
+
+
+def calculate_center_temperature(query):
+    first, end = center_query_dates(query)
+    area = ee.Geometry.Point([query.longitude, query.latitude]).buffer(CENTER_RADIUS_M)
+    collection = (ee.ImageCollection(DATASET).filterDate(first.isoformat(), end.isoformat())
+                  .filterBounds(area).map(to_celsius).sort("system:time_start"))
+    count = collection.size().getInfo()
+    result = {
+        "schema": "center-temperature-v1", "status": "ok" if count else "no_images",
+        "dataset": DATASET, "band": "LST_Day_1km", "unit": "degC", "scale_m": 1000,
+        "longitude": query.longitude, "latitude": query.latitude, "center_radius_m": CENTER_RADIUS_M,
+        "year": query.year, "month": query.month, "day": query.day,
+        "period": {"mode": "day" if query.day is not None else "month", "start": first.isoformat(), "end_exclusive": end.isoformat()},
+        "image_count": count, "total_pixels": 0,
+        "statistics": {"mean": None, "min": None, "max": None, "valid_pixels": 0, "coverage_fraction": None},
+        "daily": [], "map_png_base64": None,
+        "visualization": {"min": -20, "max": 50, "unit": "degC", "palette": CENTER_PALETTE,
+                          "crs": "EPSG:3857", "clip": "center_circle", "radius_m": CENTER_RADIUS_M},
+        "warnings": [],
+        "notes": {"temperature": "Daytime satellite land surface temperature; not 2m air temperature or a full-day average.",
+                  "region": "A 30km radius around the requested reference point, not an administrative boundary.",
+                  "quality": "Original product mask; no additional QC_Day screening.",
+                  "monthly": "Statistics of the monthly mean image; not an arithmetic mean of daily region means.",
+                  "missing": "Missing pixels are not zero-filled or interpolated; coverage uses the same native grid."},
+    }
+    if not count:
+        result["daily"] = center_daily_rows(first, end, [], 0)
+        return result
+    projection = ee.Image(collection.first()).projection()
+    reducer = (ee.Reducer.mean().combine(ee.Reducer.count(), sharedInputs=True)
+               .combine(ee.Reducer.min(), sharedInputs=True).combine(ee.Reducer.max(), sharedInputs=True))
+
+    def reduce_image(image):
+        return image.reduceRegion(reducer=reducer, geometry=area, scale=1000, crs=projection, maxPixels=1e7)
+
+    def daily_statistics(image):
+        values = reduce_image(image)
+        return image.set("center_daily", ee.Dictionary({
+            "date": image.date().format("YYYY-MM-dd"), "mean": values.get("LST_C_mean"),
+            "min": values.get("LST_C_min"), "max": values.get("LST_C_max"),
+            "valid_pixels": values.get("LST_C_count"),
+        }))
+
+    mean_image = collection.mean()
+    values = ee.Dictionary({
+        "summary": reduce_image(mean_image),
+        "total": ee.Image.constant(1).rename("pixels").reduceRegion(
+            reducer=ee.Reducer.count(), geometry=area, scale=1000, crs=projection, maxPixels=1e7),
+        "daily": collection.map(daily_statistics).aggregate_array("center_daily"),
+    }).getInfo()
+    total = int(values["total"].get("pixels") or 0)
+    summary = values["summary"]
+    pixels = int(summary.get("LST_C_count") or 0)
+    result["total_pixels"] = total
+    result["statistics"] = {"mean": summary.get("LST_C_mean"), "min": summary.get("LST_C_min"),
+                            "max": summary.get("LST_C_max"), "valid_pixels": pixels,
+                            "coverage_fraction": pixels / total if total else None}
+    result["daily"] = center_daily_rows(first, end, values.get("daily") or [], total)
+    if pixels == 0 or summary.get("LST_C_mean") is None:
+        result["status"] = "missing_pixels"
+    elif query.include_map:
+        try:
+            # area 是圆，而非其包围矩形；圆外与缺测保持掩膜。
+            result["map_png_base64"] = download_map(mean_image, area, palette=CENTER_PALETTE, white_background=True)
+        except Exception as error:
+            logger.warning("Center map generation failed (%s): %s", type(error).__name__, safe_error_message(error))
+            result["warnings"].append("map_unavailable")
+    return result
+
+
+@app.post("/temperature/center", dependencies=[Depends(check_token)])
+def center_temperature(query: CenterTemperatureQuery):
+    center_query_dates(query)
+    return run_gee(lambda: calculate_center_temperature(query))
