@@ -39,6 +39,7 @@ gee_lock = threading.Lock()
 gee_ready = False
 gee_connection = "not_started"
 map_check = {"status": "not_started"}
+history_check = {"status": "not_started"}
 DATASET = "MODIS/061/MOD11A1"
 
 
@@ -130,10 +131,10 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 7,
-            "capabilities": ["center-temperature-30km-v1"],
+    return {"status": "ok", "service": "gee-worker", "api_version": 8,
+            "capabilities": ["center-temperature-30km-v1", "center-history-30km-v1"],
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
-            "map_check": map_check}
+            "map_check": map_check, "history_check": history_check}
 
 
 @app.get("/platform/install.sh", include_in_schema=False)
@@ -193,6 +194,15 @@ def startup_gee_check():
         else:
             map_check.update(result)
             logger.info("GEE_MAP_CHECK_OK: generated %s bytes", result["png_bytes"])
+        history_check.update(status="checking")
+        try:
+            result = run_gee(check_history_connection)
+        except HTTPException as error:
+            history_check.update(status="failed", message=safe_error_message(error.detail))
+            logger.error("GEE_HISTORY_CHECK_FAILED: %s", json.dumps(history_check, ensure_ascii=False))
+        else:
+            history_check.update(status="ok", sample=result)
+            logger.info("GEE_HISTORY_CHECK_OK: %s annual records", len(result["years"]))
 
 
 @app.get("/gee-check", dependencies=[Depends(check_token)])
@@ -520,3 +530,90 @@ def calculate_center_temperature(query):
 def center_temperature(query: CenterTemperatureQuery):
     center_query_dates(query)
     return run_gee(lambda: calculate_center_temperature(query))
+
+
+class CenterHistoryQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-85, le=85)
+    year: int = Field(ge=2000, le=2100)
+    month: int = Field(ge=1, le=12)
+
+
+def history_years(query, today=None):
+    today = today or datetime.now(timezone.utc).date()
+    if date(query.year, query.month, 1) > today:
+        raise HTTPException(422, detail="A future month cannot be queried")
+    return list(range(max(2000, query.year - 9), query.year + 1))
+
+
+def calculate_center_history(query):
+    """一次批量计算十个同月影像，不下载十张PNG、不累加日均温。"""
+    years = history_years(query)
+    area = ee.Geometry.Point([query.longitude, query.latitude]).buffer(CENTER_RADIUS_M)
+    last_first = date(query.year, query.month, 1)
+    last_end = (last_first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    base = (ee.ImageCollection(DATASET).filterBounds(area)
+            .filterDate(f"{years[0]}-01-01", last_end.isoformat()).map(to_celsius))
+    result = {"schema": "center-history-v1", "dataset": DATASET, "band": "LST_Day_1km",
+              "unit": "degC", "scale_m": 1000, "center_radius_m": CENTER_RADIUS_M,
+              "longitude": query.longitude, "latitude": query.latitude,
+              "end_year": query.year, "start_year": years[0], "month": query.month,
+              "total_pixels": 0, "years": [],
+              "statistic": "Regional statistics of each year's monthly pixel-mean image; original mask, no extra QC."}
+    observations = []
+    if base.size().getInfo():
+        projection = ee.Image(base.first()).projection()
+        reducer = (ee.Reducer.mean().combine(ee.Reducer.count(), sharedInputs=True)
+                   .combine(ee.Reducer.min(), sharedInputs=True).combine(ee.Reducer.max(), sharedInputs=True))
+
+        def reduce_image(image):
+            return image.reduceRegion(reducer=reducer, geometry=area, scale=1000, crs=projection, maxPixels=1e7)
+
+        def annual(year):
+            start = ee.Date.fromYMD(ee.Number(year), query.month, 1)
+            subset = base.filterDate(start, start.advance(1, "month"))
+            count = subset.size()
+            empty = {"LST_C_mean": None, "LST_C_min": None, "LST_C_max": None, "LST_C_count": 0}
+            values = ee.Dictionary(ee.Algorithms.If(count.gt(0), reduce_image(subset.mean()), empty))
+            return values.set("year", year).set("image_count", count)
+
+        values = ee.Dictionary({"total": reduce_image(ee.Image.constant(1).rename("LST_C")),
+                                "years": ee.List(years).map(annual)}).getInfo()
+        result["total_pixels"] = int(values["total"].get("LST_C_count") or 0)
+        observations = values.get("years") or []
+    by_year = {int(item["year"]): item for item in observations}
+    today = datetime.now(timezone.utc).date()
+    for year in years:
+        item = by_year.get(year, {})
+        pixels, total = int(item.get("LST_C_count") or 0), result["total_pixels"]
+        if pixels > total:
+            raise RuntimeError("Historical valid pixel count exceeds total on the same grid")
+        first = date(year, query.month, 1)
+        end = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+        count = int(item.get("image_count") or 0)
+        valid = pixels > 0 and item.get("LST_C_mean") is not None
+        result["years"].append({"year": year, "month": query.month, "start": first.isoformat(),
+                                "end_exclusive": end.isoformat(), "complete_month": end <= today,
+                                "image_count": count, "mean": item.get("LST_C_mean") if valid else None,
+                                "min": item.get("LST_C_min") if valid else None,
+                                "max": item.get("LST_C_max") if valid else None,
+                                "valid_pixels": pixels, "coverage_fraction": pixels / total if total else None,
+                                "status": "available" if valid else "no_images" if count == 0 else "missing_pixels"})
+    return result
+
+
+@app.post("/temperature/center/history", dependencies=[Depends(check_token)])
+def center_history(query: CenterHistoryQuery):
+    history_years(query)
+    return run_gee(lambda: calculate_center_history(query))
+
+
+def check_history_connection():
+    today = datetime.now(timezone.utc).date()
+    previous = today.replace(day=1) - timedelta(days=1)
+    result = calculate_center_history(CenterHistoryQuery(longitude=117.22, latitude=31.82,
+                                                       year=previous.year, month=previous.month))
+    if len(result["years"]) != min(10, previous.year - 1999) or not any(row["mean"] is not None for row in result["years"]):
+        raise RuntimeError("Historical same-month check did not return valid observations")
+    return result
