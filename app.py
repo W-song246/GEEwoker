@@ -131,8 +131,9 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 8,
-            "capabilities": ["center-temperature-30km-v1", "center-history-30km-v1"],
+    return {"status": "ok", "service": "gee-worker", "api_version": 9,
+            "capabilities": ["center-temperature-30km-v1", "center-history-30km-v1",
+                             "city-boundary-temperature-v1"],
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
             "map_check": map_check, "history_check": history_check}
 
@@ -617,3 +618,9 @@ def check_history_connection():
     if len(result["years"]) != min(10, previous.year - 1999) or not any(row["mean"] is not None for row in result["years"]):
         raise RuntimeError("Historical same-month check did not return valid observations")
     return result
+
+
+# 新城市边界网页使用独立路由；原有 /temperature 和 /temperature/center 不变。
+from city_boundary_api import register_city_api
+
+register_city_api(app, check_token, run_gee, download_map)
