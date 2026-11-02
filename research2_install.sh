@@ -51,6 +51,7 @@ if ! "$APP_DIR/.venv/bin/python" -m pip install --disable-pip-version-check --pr
     "$APP_DIR/.venv/bin/python" -m pip install --disable-pip-version-check --prefer-binary \
         --timeout 45 --retries 1 -r "$APP_DIR/requirements.txt"
 fi
+"$APP_DIR/.venv/bin/python" -c 'import ee, folium, gradio, matplotlib, sniffio, zhipuai'
 echo '[4/5] 沿用原取数配置，检查新版连接'
 "$APP_DIR/.venv/bin/python" "$APP_DIR/configure_server.py"
 "$APP_DIR/.venv/bin/python" - "$APP_DIR" <<'PY'
