@@ -18,6 +18,8 @@ from pydantic import BaseModel, ConfigDict, Field
 DATASET = "MODIS/061/MOD11A1"
 SCHEMA = "city-boundary-temperature-v1"
 ROOT = "https://raw.githubusercontent.com/junwang23/geoCN/master/geojson/"
+ADMIN_ROOT = "https://raw.githubusercontent.com/modood/Administrative-divisions-of-China/master/dist/"
+DISTRICT_ROOT = "https://raw.githubusercontent.com/pamaforce/geojson/main/geojson_wgs84/100000/"
 PALETTE = ["173f96", "53b8e8", "9fe3cb", "ffe68a", "ef754e", "bb2847"]
 MUNICIPALITIES = {"北京": "Beijing", "天津": "Tianjin", "上海": "Shanghai", "重庆": "Chongqing"}
 grid_counts = {}
@@ -26,6 +28,7 @@ grid_counts = {}
 class CityName(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     city: str = Field(min_length=2, max_length=40)
+    district: str | None = Field(default=None, min_length=2, max_length=40)
 
 
 class CityQuery(CityName):
@@ -50,7 +53,59 @@ def boundary_file(filename):
     return response.json()["features"]
 
 
-def city_boundary(city):
+@lru_cache(maxsize=1)
+def administrative_index():
+    cities = requests.get(ADMIN_ROOT + "cities.json", timeout=(8, 40))
+    areas = requests.get(ADMIN_ROOT + "areas.json", timeout=(8, 40))
+    cities.raise_for_status()
+    areas.raise_for_status()
+    return cities.json(), areas.json()
+
+
+@lru_cache(maxsize=256)
+def district_geometry(code):
+    province = code[:2] + "0000"
+    city = code[:4] + "00"
+    parts = [province, code] if code[:2] in {"11", "12", "31", "50"} else [province, city, code]
+    filename = "geojson_wgs84/100000/" + "/".join(parts) + "/" + code + ".json"
+    response = requests.get(DISTRICT_ROOT + "/".join(parts) + "/" + code + ".json",
+                            timeout=(8, 40))
+    response.raise_for_status()
+    features = response.json().get("features", [])
+    if len(features) != 1 or str(features[0]["properties"].get("adcode")) != code:
+        raise HTTPException(422, detail="区界文件与所选行政区代码不一致。")
+    return features[0], filename
+
+
+def district_boundary(city, district):
+    name = city.strip().removesuffix("市")
+    district = district.strip()
+    if not district.endswith("区"):
+        raise HTTPException(422, detail="目前支持市辖区查询，请输入完整区名，例如“蜀山区”。")
+    cities, areas = administrative_index()
+    if name in MUNICIPALITIES:
+        codes = {str(item["code"]) for item in cities
+                 if str(item["provinceCode"]) == {"北京":"11","天津":"12","上海":"31","重庆":"50"}[name]
+                 and item["name"] == "市辖区"}
+    else:
+        codes = {str(item["code"]) for item in cities if item["name"].removesuffix("市") == name}
+    matches = [item for item in areas if str(item["cityCode"]) in codes and item["name"] == district]
+    if len(matches) != 1:
+        raise HTTPException(422, detail=f"未找到“{name}{district}”的唯一区界，请核对城市与区名。")
+    code = str(matches[0]["code"])
+    try:
+        feature, filename = district_geometry(code)
+    except requests.HTTPError as error:
+        if error.response is not None and error.response.status_code == 404:
+            raise HTTPException(422, detail=f"{name}{district}暂缺可用区界，未返回全市数据。") from None
+        raise
+    feature = {**feature, "properties": {**feature["properties"], "name": district}}
+    return feature, filename
+
+
+def city_boundary(city, district=None):
+    if district:
+        return district_boundary(city, district)
     name = city.strip().removesuffix("市")
     if name.endswith(("区", "县")):
         raise HTTPException(422, detail="当前接口只支持城市和直辖市边界。")
@@ -89,10 +144,10 @@ def reduce_image(image, area, projection):
 
 
 def context(query):
-    feature, filename = city_boundary(query.city)
+    feature, filename = city_boundary(query.city, query.district)
     area = ee.Geometry(feature["geometry"])
     projection = ee.ImageCollection(DATASET).first().select("LST_Day_1km").projection()
-    key = feature["properties"]["name"]
+    key = query.city + "/" + (query.district or "")
     cached = grid_counts.get(key)
     if cached and cached[0] > time.monotonic():
         total = cached[1]
@@ -158,7 +213,8 @@ def calculate(query, download_map):
     validate_period(query)
     area, projection, total, filename = context(query)
     result = {"schema": SCHEMA, "dataset": DATASET, "operation": query.operation,
-              "city": query.city, "start": query.start.isoformat(), "end": query.end.isoformat(),
+              "city": query.city, "district": query.district,
+              "start": query.start.isoformat(), "end": query.end.isoformat(),
               "unit": "degC", "scale_m": 1000, "total": total, "boundary_file": filename,
               "quality": "QC_Day mandatory QA=0; LST error<=2K"}
     collection = images(query.start, query.end, area)
@@ -188,7 +244,7 @@ def register_city_api(app, check_token, run_gee, download_map):
     @app.post("/research2/boundary", dependencies=[Depends(check_token)])
     def boundary(query: CityName):
         try:
-            feature, filename = city_boundary(query.city)
+            feature, filename = city_boundary(query.city, query.district)
             return {"schema": SCHEMA, "feature": feature, "boundary_file": filename}
         except requests.RequestException:
             raise HTTPException(502, detail="暂时无法读取城市边界数据。") from None
