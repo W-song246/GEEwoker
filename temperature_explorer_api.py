@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import date
 from pathlib import Path
+from typing import Literal
 
 import ee
 from fastapi import Depends, HTTPException
@@ -23,6 +24,7 @@ _cache_lock = threading.Lock()
 class ExplorerQuery(city.CityName):
     start: date
     end: date
+    metric: Literal['temperature', 'ndvi'] = 'temperature'
 
 
 class PointQuery(ExplorerQuery):
@@ -74,6 +76,7 @@ def window_data(query, area, projection):
 
 def metadata(query, operation):
     return {"schema": SCHEMA, "dataset": city.DATASET, "operation": operation,
+            "metric": "temperature",
             "city": query.city, "district": query.district,
             "start": query.start.isoformat(), "end": query.end.isoformat(),
             "unit": "degC", "nominal_resolution_m": 1000,
@@ -127,7 +130,9 @@ def point(query, download_map):
     observed = collection.map(attach).aggregate_array("point_daily").getInfo() or []
     by_date = {r["date"]: r.get("LST_C") for r in observed}
     point_rows = [{"date": r["date"], "value": by_date.get(r["date"])} for r in data["daily"]]
+    feature, filename = city.city_boundary(query.city, query.district)
     return {**metadata(query, "point"), "longitude": query.longitude, "latitude": query.latitude,
+            "feature": feature, "boundary_file": filename,
             "radius_m": query.radius_m,
             "point": {"value": value, "pixel_geometry": footprint, "daily": point_rows,
                       "statistic": "Native pixel containing selected point; no nearest-valid replacement"},
@@ -163,7 +168,11 @@ def cached(query, operation, run_gee, download_map):
         entry = _cache.get(key)
         if entry and entry[0] > time.monotonic():
             return entry[1]
-    operation_function={'region':region,'point':point,'history':history}[operation]
+    if query.metric == 'ndvi':
+        import vegetation_explorer_api as vegetation
+        operation_function = getattr(vegetation, operation)
+    else:
+        operation_function={'region':region,'point':point,'history':history}[operation]
     value = run_gee(lambda: operation_function(query, download_map))
     with _cache_lock:
         if len(_cache) >= 24:

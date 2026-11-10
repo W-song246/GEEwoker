@@ -14,7 +14,7 @@ if ss -lntH | awk '{print $4}' | grep -Eq ':7862$'; then
 fi
 echo '[1/6] 检查新版卫星接口'
 curl -fsS --connect-timeout 15 --max-time 120 "$WORKER_URL/health" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert "temperature-explorer-v1" in d.get("capabilities", []), "Render新版尚未就绪，请等待部署完成后重试。"'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert {"temperature-explorer-v1","vegetation-ndvi-v1"}.issubset(d.get("capabilities", [])), "温度和植被接口尚未就绪，请等待Render部署完成后重试。"'
 
 echo '[2/6] 下载并核验独立部署包，保留旧网页'
 ARCHIVE=$(mktemp /tmp/research2-explorer.XXXXXX.zip)
@@ -99,19 +99,19 @@ echo '[6/6] 执行一次真实卫星取数检查（不调用AI）'
 "$APP_DIR/.venv/bin/python" - <<'PY'
 import requests,time
 session=requests.Session()
-response=session.post('http://127.0.0.1:7862/api/query',json={'text':'合肥蜀山区2025年7月15日温度','auto_ai':False},timeout=15)
+response=session.post('http://127.0.0.1:7862/api/query',json={'text':'合肥蜀山区2025年7月温度和植被','auto_ai':False},timeout=15)
 response.raise_for_status();job=response.json().get('job_id')
 if not job:raise SystemExit('安装后的查询条件校验未通过')
 for attempt in range(100):
     result=session.get('http://127.0.0.1:7862/api/jobs/'+job,timeout=10).json()
     if result.get('status')=='done':
-        if not result.get('results'):
+        if result.get('errors') or {row.get('metric','temperature') for row in result.get('results',[])} != {'temperature','ndvi'}:
             print('网页已启动，但真实取数未通过：'+ '; '.join(row.get('message','未完成') for row in result.get('errors',[])))
             raise SystemExit(1)
-        data=result['results'][0]
-        assert data['source_mode']=='live' and data['query']['district']=='蜀山区'
-        assert 0<=data['summary']['coverage']<=100
-        print('真实卫星接口已返回；有效像元：'+str(data['summary']['count'])+'，覆盖率：'+str(data['summary']['coverage'])+'%。')
+        for data in result['results']:
+            assert data['source_mode']=='live' and data['query']['district']=='蜀山区'
+            assert 0<=data['summary']['coverage']<=100
+            print(data.get('metric','temperature')+'真实接口已返回；有效像元：'+str(data['summary']['count'])+'，覆盖率：'+str(data['summary']['coverage'])+'%。')
         break
     time.sleep(3)
 else:

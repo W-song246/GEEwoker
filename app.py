@@ -40,6 +40,7 @@ gee_ready = False
 gee_connection = "not_started"
 map_check = {"status": "not_started"}
 history_check = {"status": "not_started"}
+vegetation_check = {"status": "not_started"}
 DATASET = "MODIS/061/MOD11A1"
 
 
@@ -131,11 +132,11 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 10,
+    return {"status": "ok", "service": "gee-worker", "api_version": 11,
             "capabilities": ["center-temperature-30km-v1", "center-history-30km-v1",
-                               "city-boundary-temperature-v1", "temperature-explorer-v1"],
+                               "city-boundary-temperature-v1", "temperature-explorer-v1", "vegetation-ndvi-v1"],
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
-            "map_check": map_check, "history_check": history_check}
+            "map_check": map_check, "history_check": history_check, "vegetation_check": vegetation_check}
 
 
 @app.get("/platform/install.sh", include_in_schema=False)
@@ -204,6 +205,16 @@ def startup_gee_check():
         else:
             history_check.update(status="ok", sample=result)
             logger.info("GEE_HISTORY_CHECK_OK: %s annual records", len(result["years"]))
+        vegetation_check.update(status='checking')
+        try:
+            from vegetation_explorer_api import check_connection
+            result = run_gee(lambda: check_connection(download_map))
+        except HTTPException as error:
+            detail = error.detail if isinstance(error.detail, dict) else {'message': str(error.detail)}
+            vegetation_check.update(status='failed', error_type=detail.get('error_type'),
+                                    message=safe_error_message(detail.get('message', 'Vegetation check failed')))
+        else:
+            vegetation_check.update(status='ok', **result)
 
 
 @app.get("/gee-check", dependencies=[Depends(check_token)])
@@ -249,7 +260,7 @@ def make_daily_rows(year, month, observations):
     return rows
 
 
-def download_map(image, area, palette=None, white_background=False):
+def download_map(image, area, palette=None, white_background=False, minimum=-20, maximum=50):
     """通过已有的计算权限直接取得 PNG，不创建额外的缩略图资源。"""
     coordinates = area.bounds(maxError=100, proj="EPSG:3857").coordinates().getInfo()[0]
     xs = [point[0] for point in coordinates]
@@ -263,7 +274,7 @@ def download_map(image, area, palette=None, white_background=False):
     width = max(1, min(700, math.ceil(span_x / pixel_size)))
     height = max(1, min(700, math.ceil(span_y / pixel_size)))
     visual = image.clip(area).visualize(
-        min=-20, max=50, forceRgbOutput=True,
+        min=minimum, max=maximum, forceRgbOutput=True,
         palette=palette or ["0000ff", "00ffff", "00ff00", "ffff00", "ff0000"],
     )
     if white_background:
