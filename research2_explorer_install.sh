@@ -93,6 +93,8 @@ done
 if [ "$READY" != 1 ]; then
     echo '新版尚未启动，旧7861网页保留。请检查 sudo journalctl -u research2-explorer -n 40 --no-pager';exit 1
 fi
+echo '新版网页已启动：http://121.5.5.98:7862/'
+echo '请打开7862地址查看新版；原7861地址显示旧网页。'
 echo '[6/6] 执行一次真实卫星取数检查（不调用AI）'
 "$APP_DIR/.venv/bin/python" - <<'PY'
 import requests,time

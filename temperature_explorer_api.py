@@ -34,8 +34,11 @@ class PointQuery(ExplorerQuery):
 def native_reduce(image, area, projection, reducer=None):
     reducer = reducer or (ee.Reducer.mean().combine(ee.Reducer.minMax(), sharedInputs=True)
                           .combine(ee.Reducer.count(), sharedInputs=True))
+    # Projection already contains its native affine grid. transform() returns
+    # a WKT String, whereas reduceRegion.crsTransform requires six numbers.
+    # Keep the full Projection and omit scale so its native grid is retained.
     return image.reduceRegion(reducer=reducer, geometry=area, crs=projection,
-                              crsTransform=projection.transform(), maxPixels=1e9, tileScale=4)
+                              maxPixels=1e9, tileScale=4)
 
 
 def composite(collection, projection):
