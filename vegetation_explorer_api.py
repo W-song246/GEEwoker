@@ -26,13 +26,25 @@ def prepare(image):
             .set('period_end_exclusive', period_end(image).millis()))
 
 
+def selected_observation(image, query):
+    start = ee.Date.fromYMD(image.date().get('year'), 1, 1).millis()
+    observed = image.select('DayOfYear').subtract(1).multiply(86400000).add(start)
+    inside = observed.gte(ee.Date(query.start.isoformat()).millis()).And(
+        observed.lt(ee.Date((query.end+timedelta(days=1)).isoformat()).millis()))
+    inside=inside.And(image.select('DayOfYear').gte(1)).And(image.select('DayOfYear').lte(366))
+    return (ee.Image(prepare(image)).updateMask(inside)
+            .set('source_period_start',image.date().format('YYYY-MM-dd'))
+            .set('source_period_end',period_end(image).advance(-1,'day').format('YYYY-MM-dd'))
+            .set('selection_start',ee.Date(image.date().millis().max(ee.Date(query.start.isoformat()).millis())).format('YYYY-MM-dd'))
+            .set('selection_end',ee.Date(period_end(image).advance(-1,'day').millis().min(ee.Date(query.end.isoformat()).millis())).format('YYYY-MM-dd')))
+
+
 def images(query, area):
-    first = query.start - timedelta(days=15) if query.start == query.end else query.start
+    first = query.start - timedelta(days=15)
     collection = (ee.ImageCollection(DATASET)
                   .filterDate(first.isoformat(), (query.end + timedelta(days=1)).isoformat())
-                  .filterBounds(area).map(prepare))
-    if query.start == query.end:
-        collection = collection.filter(ee.Filter.gt('period_end_exclusive', ee.Date(query.start.isoformat()).millis()))
+                  .filterBounds(area).map(lambda image:selected_observation(image,query)))
+    collection = collection.filter(ee.Filter.gt('period_end_exclusive', ee.Date(query.start.isoformat()).millis()))
     return collection.sort('system:time_start')
 
 
@@ -55,9 +67,11 @@ def rows(collection, area, projection, point=False):
     def attach(image):
         reducer = ee.Reducer.first() if point else None
         return image.set('observation', native_reduce(image, area, projection, reducer)
-                         .set('date', image.date().format('YYYY-MM-dd'))
-                         .set('period_start', image.date().format('YYYY-MM-dd'))
-                         .set('period_end', ee.Date(image.get('period_end_exclusive')).advance(-1, 'day').format('YYYY-MM-dd')))
+                         .set('date', image.get('selection_start'))
+                         .set('period_start', image.get('selection_start'))
+                         .set('period_end', image.get('selection_end'))
+                         .set('source_period_start',image.get('source_period_start'))
+                         .set('source_period_end',image.get('source_period_end')))
     return collection.map(attach).aggregate_array('observation')
 
 
@@ -74,7 +88,7 @@ def window_data(query, area, projection):
         'image_count': collection.size(),
     }).getInfo()
     total = int((values.get('total') or {}).get('NDVI_count') or 0)
-    observations = [{**{key: row[key] for key in ('date', 'period_start', 'period_end')},
+    observations = [{**{key: row[key] for key in ('date', 'period_start', 'period_end','source_period_start','source_period_end') if key in row},
                      **statistics(row, total)} for row in values.get('observations', [])]
     samples = [float(value) for value in values.get('samples', []) if value is not None]
     return image, collection, {
@@ -82,7 +96,7 @@ def window_data(query, area, projection):
         'summary': statistics(values.get('summary'), total), 'total': total,
         'daily': [], 'observations': observations, 'samples': samples,
         'sample_count': len(samples), 'sample_limit': 3000,
-        'sample_basis': 'Seeded valid native NDVI pixels from the product-period pixel-mean image',
+        'sample_basis': 'Seeded valid native NDVI pixels; selected pixel observation dates strictly inside requested window',
         'image_count': int(values.get('image_count') or 0),
         'actual_periods': [{'start': row['period_start'], 'end': row['period_end']} for row in observations],
     }
@@ -93,9 +107,8 @@ def metadata(query, operation):
             'city': query.city, 'district': query.district, 'start': query.start.isoformat(), 'end': query.end.isoformat(),
             'unit': 'NDVI', 'nominal_resolution_m': 250, 'cadence': '16-day composite',
             'quality': 'SummaryQA=0; DetailedQA land/water=1 (land); valid raw NDVI -2000..10000; scale=0.0001',
-            'time_basis': 'covering_product_period' if query.start == query.end else 'product_start_in_requested_range',
-            'temporal_note': ('显示覆盖所选日期的16天合成期，不代表当天观测。' if query.start == query.end else
-                              '按合成期起始日期归组；产品期可能跨月，图表及明细标明实际时段。'),
+            'time_basis': 'actual_pixel_observation_date_inside_requested_range',
+            'temporal_note': '16天合成源产品，按DayOfYear逐像元筛选，只纳入所选日期范围内被选中的观测；区间外观测已排除。没有观测的日期不补值。',
             'statistic': 'Spatial statistics of QC-valid product-period pixel-mean NDVI; NDVI is not vegetation coverage %'}
 
 
@@ -124,7 +137,7 @@ def point(query, download_map):
                         projection, ee.Reducer.first()).getInfo() or {}
     footprint = (pixel_polygon(raw['x'], raw['y'], grid['transform'], grid['crs']).getInfo()
                  if raw.get('x') is not None and raw.get('y') is not None else None)
-    point_rows = [{**{key: row[key] for key in ('date', 'period_start', 'period_end')}, 'value': row.get('NDVI')}
+    point_rows = [{**{key: row[key] for key in ('date', 'period_start', 'period_end','source_period_start','source_period_end') if key in row}, 'value': row.get('NDVI')}
                   for row in (rows(collection, location, projection, point=True).getInfo() or [])]
     feature, filename = city.city_boundary(query.city, query.district)
     return {**metadata(query, 'point'), 'longitude': query.longitude, 'latitude': query.latitude,
@@ -160,10 +173,15 @@ def check_connection(download_map):
     query = ExplorerQuery(city='合肥', district='蜀山区', start=date(2025, 7, 1), end=date(2025, 7, 31), metric='ndvi')
     result = region(query, download_map)
     selected = point(PointQuery(**query.model_dump(), longitude=117.2, latitude=31.85), download_map)
+    from relationship_explorer_api import relationship
+    from temperature_explorer_api import RelationshipQuery
+    relation=relationship(RelationshipQuery(**{**query.model_dump(),'metric':'temperature'}),download_map)
     if not result['summary']['count'] or not result['map_png_base64'] or not selected['point']['pixel_geometry']:
         raise RuntimeError('NDVI self-check did not return valid native-grid observations and image')
     return {'dataset': DATASET, 'metric': 'ndvi', 'query': query.model_dump(mode='json'),
             'summary': result['summary'], 'periods': result['actual_periods'],
             'png_bytes': len(base64.b64decode(result['map_png_base64'])),
             'point_value': selected['point']['value'], 'neighborhood': selected['neighborhood']['summary'],
-            'point_pixel_geometry': bool(selected['point']['pixel_geometry'])}
+            'point_pixel_geometry': bool(selected['point']['pixel_geometry']),
+            'relationship':{key:relation[key] for key in ('status','sample_count','pearson_r','note')},
+            'time_basis':metadata(query,'region')['time_basis']}

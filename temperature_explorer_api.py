@@ -33,6 +33,11 @@ class PointQuery(ExplorerQuery):
     radius_m: int = Field(default=1000, ge=1000, le=1000)
 
 
+class RelationshipQuery(ExplorerQuery):
+    longitude: float | None = Field(default=None,ge=-180,le=180)
+    latitude: float | None = Field(default=None,ge=-85,le=85)
+
+
 def native_reduce(image, area, projection, reducer=None):
     reducer = reducer or (ee.Reducer.mean().combine(ee.Reducer.minMax(), sharedInputs=True)
                           .combine(ee.Reducer.count(), sharedInputs=True))
@@ -168,7 +173,10 @@ def cached(query, operation, run_gee, download_map):
         entry = _cache.get(key)
         if entry and entry[0] > time.monotonic():
             return entry[1]
-    if query.metric == 'ndvi':
+    if operation == 'relationship':
+        from relationship_explorer_api import relationship
+        operation_function=relationship
+    elif query.metric == 'ndvi':
         import vegetation_explorer_api as vegetation
         operation_function = getattr(vegetation, operation)
     else:
@@ -182,6 +190,11 @@ def cached(query, operation, run_gee, download_map):
 
 
 def register_explorer_api(app, check_token, run_gee, download_map):
+    @app.post('/research2/explorer/relationship',dependencies=[Depends(check_token)])
+    def query_relationship(query:RelationshipQuery):
+        city.validate_period(query)
+        if (query.longitude is None)!=(query.latitude is None):raise HTTPException(422,'经纬度需要同时提供。')
+        return cached(query,'relationship',run_gee,download_map)
     @app.post("/research2/explorer/region", dependencies=[Depends(check_token)])
     def query_region(query: ExplorerQuery):
         city.validate_period(query)

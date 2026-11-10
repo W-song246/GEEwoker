@@ -132,9 +132,9 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 11,
+    return {"status": "ok", "service": "gee-worker", "api_version": 12,
             "capabilities": ["center-temperature-30km-v1", "center-history-30km-v1",
-                               "city-boundary-temperature-v1", "temperature-explorer-v1", "vegetation-ndvi-v1"],
+                               "city-boundary-temperature-v1", "temperature-explorer-v1", "vegetation-ndvi-v1", "temperature-vegetation-relationship-v1"],
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
             "map_check": map_check, "history_check": history_check, "vegetation_check": vegetation_check}
 

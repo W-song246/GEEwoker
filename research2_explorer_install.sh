@@ -14,7 +14,7 @@ if ss -lntH | awk '{print $4}' | grep -Eq ':7862$'; then
 fi
 echo '[1/6] 检查新版卫星接口'
 curl -fsS --connect-timeout 15 --max-time 120 "$WORKER_URL/health" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert {"temperature-explorer-v1","vegetation-ndvi-v1"}.issubset(d.get("capabilities", [])), "温度和植被接口尚未就绪，请等待Render部署完成后重试。"'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert {"temperature-explorer-v1","vegetation-ndvi-v1","temperature-vegetation-relationship-v1"}.issubset(d.get("capabilities", [])), "温度植被联合分析接口尚未就绪，请等待Render部署完成后重试。"'
 
 echo '[2/6] 下载并核验独立部署包，保留旧网页'
 ARCHIVE=$(mktemp /tmp/research2-explorer.XXXXXX.zip)
