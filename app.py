@@ -131,9 +131,9 @@ def run_gee(operation):
 @app.get("/health")
 def health():
     # status 只说明进程在运行；gee_connection 才表示实际的 GEE 检测结果。
-    return {"status": "ok", "service": "gee-worker", "api_version": 9,
+    return {"status": "ok", "service": "gee-worker", "api_version": 10,
             "capabilities": ["center-temperature-30km-v1", "center-history-30km-v1",
-                             "city-boundary-temperature-v1"],
+                               "city-boundary-temperature-v1", "temperature-explorer-v1"],
             "gee_initialized": gee_ready, "gee_connection": gee_connection,
             "map_check": map_check, "history_check": history_check}
 
@@ -624,3 +624,6 @@ def check_history_connection():
 from city_boundary_api import register_city_api
 
 register_city_api(app, check_token, run_gee, download_map)
+
+from temperature_explorer_api import register_explorer_api
+register_explorer_api(app, check_token, run_gee, download_map)
