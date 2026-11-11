@@ -95,6 +95,15 @@ if [ "$READY" != 1 ]; then
 fi
 echo '新版网页已启动：http://121.5.5.98:7862/'
 echo '请打开7862地址查看新版；原7861地址显示旧网页。'
+"$APP_DIR/.venv/bin/python" - "$APP_DIR" <<'PY'
+import json,pathlib,sys,requests
+manifest=json.loads((pathlib.Path(sys.argv[1])/'manifest.json').read_text(encoding='utf-8'))
+status=requests.get('http://127.0.0.1:7862/api/status',timeout=10).json()
+expected='eco-explorer-'+manifest['version']
+if status.get('version')!=expected:raise SystemExit('运行版本与更新包不一致，请检查服务启动目录。')
+print('当前运行版本：'+status['version'])
+print('请用新标签页打开：http://121.5.5.98:7862/?v='+manifest['version'].split('-')[-1].replace('.',''))
+PY
 echo '[6/6] 执行一次真实卫星取数检查（不调用AI）'
 "$APP_DIR/.venv/bin/python" - <<'PY'
 import requests,time
